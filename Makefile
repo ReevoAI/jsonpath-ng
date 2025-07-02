@@ -15,16 +15,15 @@ htmldocs:
 	$(MAKE) -C docs html
 
 install:
-	@pip install -r requirements.txt
-	@pip install -r requirements-dev.txt
+	@uv sync --all-extras
 
 lint:
 	@echo "$(OK_COLOR)==> Linting code ...$(NO_COLOR)"
-	@flake8 --exclude=tests .
+	@uv run flake8 --exclude=tests,venv,.venv,build,dist jsonpath_ng
 
 test: clean
 	@echo "$(OK_COLOR)==> Running tests ...$(NO_COLOR)"
-	@tox
+	@uv run tox
 
 tag:
 	@echo "$(OK_COLOR)==> Creating tag $(version) ...$(NO_COLOR)"
@@ -47,6 +46,6 @@ clean:
 
 publish:
 	@echo "$(OK_COLOR)==> Releasing package ...$(NO_COLOR)"
-	@python setup.py sdist bdist_wheel
-	@twine upload dist/*
+	@uv build
+	@uv run twine upload dist/*
 	@rm -fr build dist .egg pook.egg-info

@@ -1,3 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jsonpath-ng"
+version = "1.7.0"
+description = "A final implementation of JSONPath for Python that aims to be standard compliant, including arithmetic and binary comparison operators and providing clear AST for metaprogramming."
+authors = [
+    {name = "Tomas Aparicio", email = "tomas@aparicio.me"}
+]
+license = {text = "Apache 2.0"}
+readme = "README.rst"
+requires-python = ">=3.8"
+dependencies = [
+    "ply",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+keywords = ["jsonpath", "json", "xpath"]
+
+[project.urls]
+Homepage = "https://github.com/h2non/jsonpath-ng"
+Repository = "https://github.com/h2non/jsonpath-ng"
+Issues = "https://github.com/h2non/jsonpath-ng/issues"
+
+[project.scripts]
+jsonpath_ng = "jsonpath_ng.bin.jsonpath:entry_point"
+
+[project.optional-dependencies]
+dev = [
+    "tox",
+    "flake8",
+    "pytest",
+    "coverage[toml]",
+    "pytest-randomly",
+    "twine",
+    "build",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "tox",
+    "flake8", 
+    "pytest",
+    "coverage[toml]",
+    "pytest-randomly",
+    "twine",
+    "build",
+]
+
 [tool.pytest.ini_options]
 filterwarnings = [
     # Escalate warnings to errors.
@@ -6,3 +67,12 @@ filterwarnings = [
     # The ply package doesn't close its debug log file. Ignore this warning.
     "ignore::ResourceWarning",
 ]
+
+[tool.coverage.run]
+source = ["jsonpath_ng"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
