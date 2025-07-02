@@ -54,6 +54,25 @@ class JsonPathParser:
                                     errorlog = logger)
 
     def parse(self, string, lexer = None) -> JSONPath:
+        # Validate no leading or trailing whitespace per RFC 9535
+        if string != string.strip():
+            raise JsonPathParserError('JSONPath expressions must not have leading or trailing whitespace')
+        
+        # Check for specific invalid whitespace patterns per JSONPath RFC 9535
+        import re
+        
+        # Function name followed by whitespace and then parenthesis is invalid
+        if re.search(r'\b[a-zA-Z_][a-zA-Z0-9_]*\s+\(', string):
+            raise JsonPathParserError('Whitespace between function name and parenthesis is not allowed')
+        
+        # Dot followed by whitespace and then identifier is invalid  
+        if re.search(r'\.\s+[a-zA-Z_]', string):
+            raise JsonPathParserError('Whitespace between dot and field name is not allowed')
+        
+        # Double dot followed by whitespace and then identifier is invalid
+        if re.search(r'\.\.\s+[a-zA-Z_]', string):
+            raise JsonPathParserError('Whitespace between recursive descent and field name is not allowed')
+        
         lexer = lexer or self.lexer_class()
         return self.parse_token_stream(lexer.tokenize(string))
 
@@ -66,10 +85,15 @@ class JsonPathParser:
         ('left', ','),
         ('left', 'DOUBLEDOT'),
         ('left', '.'),
+        ('left', '[', ']'),  # Higher precedence for brackets
         ('left', '|'),
         ('left', '&'),
         ('left', 'WHERE'),
         ('left', 'WHERENOT'),
+        ('left', 'OR'),
+        ('left', 'AND'),
+        ('left', 'EQ', 'NE', 'LT', 'LE', 'GT', 'GE'),
+        ('right', '!'),  # Right associative for unary NOT
     ]
 
     def p_error(self, t):
@@ -102,7 +126,10 @@ class JsonPathParser:
 
     def p_jsonpath_fields(self, p):
         "jsonpath : fields_or_any"
-        p[0] = Fields(*p[1])
+        if isinstance(p[1], str):
+            p[0] = Fields(p[1])
+        else:
+            p[0] = Fields(*p[1])
 
     def p_jsonpath_named_operator(self, p):
         "jsonpath : NAMED_OPERATOR"
@@ -118,43 +145,149 @@ class JsonPathParser:
         "jsonpath : '$'"
         p[0] = Root()
 
-    def p_jsonpath_idx(self, p):
-        "jsonpath : '[' idx ']'"
-        p[0] = Index(*p[2])
+    def p_jsonpath_current(self, p):
+        "jsonpath : CURRENT"
+        p[0] = CurrentNode()
 
-    def p_jsonpath_slice(self, p):
-        "jsonpath : '[' slice ']'"
+
+    def p_empty(self, p):
+        'empty :'
+        pass
+    
+
+    def p_jsonpath_bracket_field(self, p):
+        """jsonpath : '[' ID ']'"""
+        p[0] = Fields(p[2])
+
+    def p_jsonpath_bracket_string(self, p):
+        """jsonpath : '[' STRING ']'"""
+        p[0] = Fields(p[2])
+
+    def p_jsonpath_bracket_index(self, p):
+        """jsonpath : '[' NUMBER ']'"""
+        # Validate index constraints per JSONPath RFC
+        index = p[2]
+        if not isinstance(index, int):
+            raise JsonPathParserError(f'Array indices must be integers, not {type(index).__name__}: {index}')
+        # Check for negative zero which is invalid as an array index
+        # PLY gives us the token object as p.slice[2], check if it has original_str
+        if hasattr(p.slice[2], 'original_str') and p.slice[2].original_str == '-0':
+            raise JsonPathParserError('Negative zero (-0) is not allowed as an array index')
+        # Check for indices beyond safe integer range (2^53 - 1)
+        if abs(index) > 9007199254740991:
+            raise JsonPathParserError(f'Array index {index} exceeds maximum safe integer range')
+        p[0] = Index(p[2])
+
+    def p_jsonpath_bracket_wildcard(self, p):
+        """jsonpath : '[' '*' ']'"""
+        p[0] = Fields('*')
+
+    def p_jsonpath_bracket_slice(self, p):
+        """jsonpath : '[' slice ']'"""
         p[0] = p[2]
 
-    def p_jsonpath_fieldbrackets(self, p):
-        "jsonpath : '[' fields ']'"
-        p[0] = Fields(*p[2])
+    def p_jsonpath_bracket_union(self, p):
+        """jsonpath : '[' union_list ']'"""
+        if len(p[2]) == 1:
+            p[0] = p[2][0]
+        else:
+            result = p[2][0]
+            for element in p[2][1:]:
+                result = Union(result, element)
+            p[0] = result
 
-    def p_jsonpath_child_fieldbrackets(self, p):
-        "jsonpath : jsonpath '[' fields ']'"
-        p[0] = Child(p[1], Fields(*p[3]))
+    def p_jsonpath_child_bracket_field(self, p):
+        """jsonpath : jsonpath '[' ID ']'"""
+        p[0] = Child(p[1], Fields(p[3]))
 
-    def p_jsonpath_child_idxbrackets(self, p):
-        "jsonpath : jsonpath '[' idx ']'"
-        p[0] = Child(p[1], Index(*p[3]))
+    def p_jsonpath_child_bracket_string(self, p):
+        """jsonpath : jsonpath '[' STRING ']'"""
+        p[0] = Child(p[1], Fields(p[3]))
 
-    def p_jsonpath_child_slicebrackets(self, p):
-        "jsonpath : jsonpath '[' slice ']'"
+    def p_jsonpath_child_bracket_index(self, p):
+        """jsonpath : jsonpath '[' NUMBER ']'"""
+        # Validate index constraints per JSONPath RFC
+        index = p[3]
+        if not isinstance(index, int):
+            raise JsonPathParserError(f'Array indices must be integers, not {type(index).__name__}: {index}')
+        # Check for negative zero which is invalid as an array index
+        if hasattr(p.slice[3], 'original_str') and p.slice[3].original_str == '-0':
+            raise JsonPathParserError('Negative zero (-0) is not allowed as an array index')
+        # Check for indices beyond safe integer range (2^53 - 1)
+        if abs(index) > 9007199254740991:
+            raise JsonPathParserError(f'Array index {index} exceeds maximum safe integer range')
+        p[0] = Child(p[1], Index(p[3]))
+
+    def p_jsonpath_child_bracket_wildcard(self, p):
+        """jsonpath : jsonpath '[' '*' ']'"""
+        p[0] = Child(p[1], Fields('*'))
+
+    def p_jsonpath_child_bracket_slice(self, p):
+        """jsonpath : jsonpath '[' slice ']'"""
         p[0] = Child(p[1], p[3])
+
+    def p_jsonpath_child_bracket_union(self, p):
+        """jsonpath : jsonpath '[' union_list ']'"""
+        if len(p[3]) == 1:
+            p[0] = Child(p[1], p[3][0])
+        else:
+            result = p[3][0]
+            for element in p[3][1:]:
+                result = Union(result, element)
+            p[0] = Child(p[1], result)
+
+    def p_union_list_start(self, p):
+        """union_list : union_element ',' union_element"""
+        p[0] = [p[1], p[3]]
+
+    def p_union_list_extend(self, p):
+        """union_list : union_list ',' union_element"""
+        p[0] = p[1] + [p[3]]
+
+    def p_union_element_field(self, p):
+        """union_element : ID"""
+        p[0] = Fields(p[1])
+
+    def p_union_element_string(self, p):
+        """union_element : STRING"""
+        p[0] = Fields(p[1])
+
+    def p_union_element_index(self, p):
+        """union_element : NUMBER"""
+        # Validate index constraints per JSONPath RFC
+        index = p[1]
+        if not isinstance(index, int):
+            raise JsonPathParserError(f'Array indices must be integers, not {type(index).__name__}: {index}')
+        # Check for negative zero which is invalid as an array index
+        if hasattr(p.slice[1], 'original_str') and p.slice[1].original_str == '-0':
+            raise JsonPathParserError('Negative zero (-0) is not allowed as an array index')
+        # Check for indices beyond safe integer range (2^53 - 1)
+        if abs(index) > 9007199254740991:
+            raise JsonPathParserError(f'Array index {index} exceeds maximum safe integer range')
+        p[0] = Index(p[1])
+
+    def p_union_element_wildcard(self, p):
+        """union_element : '*'"""
+        p[0] = Fields('*')
+
+    def p_union_element_slice(self, p):
+        """union_element : slice"""
+        p[0] = p[1]
+
+    def p_union_element_filter(self, p):
+        """union_element : '?' filter_expr"""
+        p[0] = Filter(p[2])
 
     def p_jsonpath_parens(self, p):
         "jsonpath : '(' jsonpath ')'"
         p[0] = p[2]
 
-    # Because fields in brackets cannot be '*' - that is reserved for array indices
+    # Field parsing for dot notation - only identifiers and wildcards allowed
     def p_fields_or_any(self, p):
         """fields_or_any : fields
-                         | '*'
-                         | NUMBER"""
+                         | '*'"""
         if p[1] == '*':
             p[0] = ['*']
-        elif isinstance(p[1], int):
-            p[0] = str(p[1])
         else:
             p[0] = p[1]
 
@@ -162,17 +295,11 @@ class JsonPathParser:
         "fields : ID"
         p[0] = [p[1]]
 
-    def p_fields_comma(self, p):
-        "fields : fields ',' fields"
-        p[0] = p[1] + p[3]
-
-    def p_idx(self, p):
-        "idx : NUMBER"
-        p[0] = [p[1]]
-
-    def p_idx_comma(self, p):
-        "idx : idx ',' idx "
-        p[0] = p[1] + p[3]
+    # Temporarily disabled to prevent conflict with function call arguments
+    # TODO: Fix grammar to allow both function calls and comma-separated fields
+    # def p_fields_comma(self, p):
+    #     "fields : fields ',' fields"
+    #     p[0] = p[1] + p[3]
 
     def p_slice_any(self, p):
         "slice : '*'"
@@ -181,16 +308,137 @@ class JsonPathParser:
     def p_slice(self, p): # Currently does not support `step`
         """slice : maybe_int ':' maybe_int
                  | maybe_int ':' maybe_int ':' maybe_int """
-        p[0] = Slice(*p[1::2])
+        args = p[1::2]
+        # Note: Per compliance tests, step 0 is allowed and should return empty result
+        # This is handled in the Slice.find() method
+        p[0] = Slice(*args)
 
     def p_maybe_int(self, p):
         """maybe_int : NUMBER
                      | empty"""
+        if p[1] is not None:
+            # Validate slice indices are within safe integer range
+            if not isinstance(p[1], int):
+                raise JsonPathParserError(f'Slice indices must be integers, not {type(p[1]).__name__}: {p[1]}')
+            if abs(p[1]) > 9007199254740991:
+                raise JsonPathParserError(f'Slice index {p[1]} exceeds maximum safe integer range')
+            # Check for negative zero in slices
+            if hasattr(p.slice[1], 'original_str') and p.slice[1].original_str == '-0':
+                raise JsonPathParserError('Negative zero (-0) is not allowed in slice expressions')
         p[0] = p[1]
 
-    def p_empty(self, p):
-        'empty :'
-        p[0] = None
+
+    # Filter expression rules
+    def p_jsonpath_filter(self, p):
+        "jsonpath : '[' '?' filter_expr ']'"
+        p[0] = Filter(p[3])
+
+    def p_jsonpath_child_filter(self, p):
+        "jsonpath : jsonpath '[' '?' filter_expr ']'"
+        p[0] = Child(p[1], Filter(p[4]))
+
+    def p_filter_expr_comparison(self, p):
+        """filter_expr : filter_expr EQ filter_expr
+                       | filter_expr NE filter_expr
+                       | filter_expr LT filter_expr
+                       | filter_expr LE filter_expr
+                       | filter_expr GT filter_expr
+                       | filter_expr GE filter_expr"""
+        p[0] = Comparison(p[1], p[2], p[3])
+
+    def p_filter_expr_logical(self, p):
+        """filter_expr : filter_expr AND filter_expr
+                       | filter_expr OR filter_expr"""
+        if p[2] == '&&':
+            p[0] = LogicalAnd(p[1], p[3])
+        else:
+            p[0] = LogicalOr(p[1], p[3])
+
+    def p_filter_expr_not(self, p):
+        """filter_expr : '!' filter_expr"""
+        p[0] = LogicalNot(p[2])
+
+    def p_filter_expr_current(self, p):
+        "filter_expr : CURRENT"
+        p[0] = CurrentNode()
+
+    def p_filter_expr_path(self, p):
+        "filter_expr : jsonpath"
+        p[0] = p[1]
+
+    def p_filter_expr_literal_number(self, p):
+        "filter_expr : NUMBER"
+        p[0] = Literal(p[1])
+
+    def p_filter_expr_literal_null(self, p):
+        "filter_expr : NULL"
+        p[0] = Literal(None)
+
+    def p_filter_expr_literal_true(self, p):
+        "filter_expr : TRUE"
+        p[0] = Literal(True)
+
+    def p_filter_expr_literal_false(self, p):
+        "filter_expr : FALSE"
+        p[0] = Literal(False)
+
+    def p_filter_expr_field(self, p):
+        "filter_expr : ID"
+        p[0] = Fields(p[1])
+
+    def p_filter_expr_string(self, p):
+        "filter_expr : STRING"
+        p[0] = Literal(p[1])
+
+    def p_filter_expr_parens(self, p):
+        "filter_expr : '(' filter_expr ')'"
+        p[0] = p[2]
+    
+    def p_filter_expr_function_call_no_args(self, p):
+        "filter_expr : ID '(' ')'"
+        # Validate function calls with no arguments
+        function_name = p[1]
+        if function_name in ['count', 'length', 'match', 'search', 'value']:
+            raise JsonPathParserError(f'Function {function_name} requires at least one argument')
+        p[0] = FunctionCall(function_name, [])
+    
+    def p_filter_expr_function_call_single(self, p):
+        "filter_expr : ID '(' filter_expr ')'"
+        function_name = p[1]
+        arg = p[3]
+        
+        # Validate function arguments per JSONPath RFC 9535
+        if function_name == 'count':
+            # count() argument must be a query expression, not a literal
+            if isinstance(arg, Literal):
+                raise JsonPathParserError('count() function argument must be a query expression, not a literal value')
+        elif function_name == 'length':
+            # length() accepts both literals and query expressions
+            # Check for non-singular queries (but only for query expressions)
+            if hasattr(arg, 'fields') and '*' in getattr(arg, 'fields', []):
+                raise JsonPathParserError('length() function argument must be a singular query expression')
+            # Check for descendants like @.* which are also non-singular
+            elif isinstance(arg, Descendants):
+                raise JsonPathParserError('length() function argument must be a singular query expression')
+            # Check for Child nodes with wildcard like @.* (parsed as Child(CurrentNode(), Fields('*')))
+            elif isinstance(arg, Child) and hasattr(arg.right, 'fields') and '*' in getattr(arg.right, 'fields', []):
+                raise JsonPathParserError('length() function argument must be a singular query expression')
+        elif function_name in ['match', 'search']:
+            # match/search need exactly 2 arguments
+            raise JsonPathParserError(f'{function_name}() function requires exactly 2 arguments')
+        
+        p[0] = FunctionCall(function_name, [arg])
+    
+    def p_filter_expr_function_call_two_args(self, p):
+        "filter_expr : ID '(' filter_expr ',' filter_expr ')'"
+        function_name = p[1]
+        
+        # Validate argument counts
+        if function_name in ['count', 'length', 'value']:
+            raise JsonPathParserError(f'{function_name}() function takes exactly 1 argument, got 2')
+        
+        p[0] = FunctionCall(function_name, [p[3], p[5]])
+    
 
 class IteratorToTokenStream:
     def __init__(self, iterator):

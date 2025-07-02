@@ -46,14 +46,17 @@ class JsonPathLexer:
     #
     # Anyhow, it is pythonic to give some rope to hang oneself with :-)
 
-    literals = ['*', '.', '[', ']', '(', ')', '$', ',', ':', '|', '&', '~']
+    literals = ['*', '.', '[', ']', '(', ')', '$', ',', ':', '|', '&', '~', '?', '!']
 
     reserved_words = {
         'where': 'WHERE',
         'wherenot': 'WHERENOT',
+        'null': 'NULL',
+        'true': 'TRUE', 
+        'false': 'FALSE',
     }
 
-    tokens = ['DOUBLEDOT', 'NUMBER', 'ID', 'NAMED_OPERATOR'] + list(reserved_words.values())
+    tokens = ['DOUBLEDOT', 'NUMBER', 'ID', 'STRING', 'NAMED_OPERATOR', 'EQ', 'NE', 'LT', 'LE', 'GT', 'GE', 'AND', 'OR', 'CURRENT'] + list(reserved_words.values())
 
     states = [ ('singlequote', 'exclusive'),
                ('doublequote', 'exclusive'),
@@ -61,19 +64,48 @@ class JsonPathLexer:
 
     # Normal lexing, rather easy
     t_DOUBLEDOT = r'\.\.'
-    t_ignore = ' \t'
+    t_EQ = r'=='
+    t_NE = r'!='
+    t_LE = r'<='
+    t_GE = r'>='
+    t_LT = r'<'
+    t_GT = r'>'
+    t_AND = r'&&'
+    t_OR = r'\|\|'
+    t_CURRENT = r'@'
+    t_ignore = ' \t\r\n'  # Back to ignoring whitespace globally for now
 
     def t_ID(self, t):
-        # CJK: [\u4E00-\u9FA5]
-        # EMOJI: [\U0001F600-\U0001F64F]
-        r'([a-zA-Z_@]|[\u4E00-\u9FA5]|[\U0001F600-\U0001F64F])([a-zA-Z0-9_@\-]|[\u4E00-\u9FA5]|[\U0001F600-\U0001F64F])*'
+        # Support broad Unicode range for identifiers per JSONPath RFC 9535
+        # Start char: Letter, underscore, or unicode symbols/pictographs
+        # Continue chars: Letter, number, underscore, hyphen, or unicode symbols/pictographs  
+        r'([a-zA-Z_]|[\u00A0-\uFFFF]|[\U00010000-\U0001FFFF])([a-zA-Z0-9_\-]|[\u00A0-\uFFFF]|[\U00010000-\U0001FFFF])*'
         t.type = self.reserved_words.get(t.value, 'ID')
         return t
 
     def t_NUMBER(self, t):
-        r'-?\d+'
-        t.value = int(t.value)
+        # JSON-compliant number format: no leading zeros (except for 0), no trailing decimal point
+        r'-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?'
+        
+        # Store original string to check for -0
+        original_str = t.value
+        
+        try:
+            # Try to parse as integer first, then float
+            if '.' in t.value or 'e' in t.value.lower():
+                t.value = float(t.value)
+            else:
+                t.value = int(t.value)
+                
+            # Store original string as an attribute for negative zero detection
+            t.original_str = original_str
+                
+        except ValueError:
+            # If parsing fails, treat as 0
+            t.value = 0
+            t.original_str = original_str
         return t
+
 
 
     # Single-quoted strings
@@ -86,16 +118,76 @@ class JsonPathLexer:
 
     def t_singlequote_content(self, t):
         r"[^'\\]+"
+        # Check for control characters (U+0000 to U+001F)
+        for char in t.value:
+            if ord(char) <= 0x1F:
+                raise JsonPathLexerError(f'Control character U+{ord(char):04X} is not allowed in string literals')
         t.lexer.string_value += t.value
+
+    # Unicode escapes need to be first to have higher precedence than regular escapes
+    def t_singlequote_unicode(self, t):
+        r'\\u[0-9a-fA-F]{4}'
+        hex_digits = t.value[2:6]
+        try:
+            code_point = int(hex_digits, 16)
+            
+            # Handle UTF-16 surrogate pairs - we need to look ahead for potential pairs
+            if 0xD800 <= code_point <= 0xDBFF:  # High surrogate
+                # Look ahead for potential low surrogate
+                remaining_input = t.lexer.lexdata[t.lexer.lexpos:]
+                import re
+                low_surrogate_match = re.match(r'\\u[0-9a-fA-F]{4}', remaining_input)
+                if low_surrogate_match:
+                    low_hex = low_surrogate_match.group()[2:]
+                    low_code_point = int(low_hex, 16)
+                    if 0xDC00 <= low_code_point <= 0xDFFF:  # Valid low surrogate
+                        # Combine high and low surrogate
+                        combined_code_point = 0x10000 + ((code_point - 0xD800) << 10) + (low_code_point - 0xDC00)
+                        unicode_char = chr(combined_code_point)
+                        # Advance the lexer position past the low surrogate
+                        t.lexer.lexpos += len(low_surrogate_match.group())
+                    else:
+                        # High surrogate followed by invalid low surrogate
+                        raise JsonPathLexerError(f'Invalid surrogate sequence: high surrogate U+{code_point:04X} followed by non-low-surrogate U+{low_code_point:04X}')
+                else:
+                    # High surrogate not followed by unicode escape - invalid
+                    raise JsonPathLexerError(f'Invalid surrogate sequence: unpaired high surrogate U+{code_point:04X}')
+            elif 0xDC00 <= code_point <= 0xDFFF:  # Low surrogate without high surrogate
+                raise JsonPathLexerError(f'Invalid surrogate sequence: unpaired low surrogate U+{code_point:04X}')
+            else:
+                # Regular BMP character
+                unicode_char = chr(code_point)
+            
+            # Check if it's a control character that should be rejected
+            if ord(unicode_char) <= 0x1F:
+                raise JsonPathLexerError(f'Control character U+{ord(unicode_char):04X} is not allowed in string literals')
+            t.lexer.string_value += unicode_char
+        except ValueError:
+            raise JsonPathLexerError(f'Invalid unicode escape sequence {t.value}')
 
     def t_singlequote_escape(self, t):
         r'\\.'
-        t.lexer.string_value += t.value[1]
+        escaped_char = t.value[1]
+        escape_map = {
+            "'": "'",
+            '\\': '\\',
+            '/': '/',
+            'b': '\b',
+            'f': '\f',
+            'n': '\n',
+            'r': '\r',
+            't': '\t'
+        }
+        
+        if escaped_char in escape_map:
+            t.lexer.string_value += escape_map[escaped_char]
+        else:
+            raise JsonPathLexerError(f'Invalid escape sequence \\{escaped_char} in string literal')
 
     def t_singlequote_end(self, t):
         r"'"
         t.value = t.lexer.string_value
-        t.type = 'ID'
+        t.type = 'STRING'  # Quoted strings are string literals
         t.lexer.string_value = None
         t.lexer.pop_state()
         return t
@@ -114,16 +206,76 @@ class JsonPathLexer:
 
     def t_doublequote_content(self, t):
         r'[^"\\]+'
+        # Check for control characters (U+0000 to U+001F)
+        for char in t.value:
+            if ord(char) <= 0x1F:
+                raise JsonPathLexerError(f'Control character U+{ord(char):04X} is not allowed in string literals')
         t.lexer.string_value += t.value
+
+    # Unicode escapes need to be first to have higher precedence than regular escapes
+    def t_doublequote_unicode(self, t):
+        r'\\u[0-9a-fA-F]{4}'
+        hex_digits = t.value[2:6]
+        try:
+            code_point = int(hex_digits, 16)
+            
+            # Handle UTF-16 surrogate pairs - we need to look ahead for potential pairs
+            if 0xD800 <= code_point <= 0xDBFF:  # High surrogate
+                # Look ahead for potential low surrogate
+                remaining_input = t.lexer.lexdata[t.lexer.lexpos:]
+                import re
+                low_surrogate_match = re.match(r'\\u[0-9a-fA-F]{4}', remaining_input)
+                if low_surrogate_match:
+                    low_hex = low_surrogate_match.group()[2:]
+                    low_code_point = int(low_hex, 16)
+                    if 0xDC00 <= low_code_point <= 0xDFFF:  # Valid low surrogate
+                        # Combine high and low surrogate
+                        combined_code_point = 0x10000 + ((code_point - 0xD800) << 10) + (low_code_point - 0xDC00)
+                        unicode_char = chr(combined_code_point)
+                        # Advance the lexer position past the low surrogate
+                        t.lexer.lexpos += len(low_surrogate_match.group())
+                    else:
+                        # High surrogate followed by invalid low surrogate
+                        raise JsonPathLexerError(f'Invalid surrogate sequence: high surrogate U+{code_point:04X} followed by non-low-surrogate U+{low_code_point:04X}')
+                else:
+                    # High surrogate not followed by unicode escape - invalid
+                    raise JsonPathLexerError(f'Invalid surrogate sequence: unpaired high surrogate U+{code_point:04X}')
+            elif 0xDC00 <= code_point <= 0xDFFF:  # Low surrogate without high surrogate
+                raise JsonPathLexerError(f'Invalid surrogate sequence: unpaired low surrogate U+{code_point:04X}')
+            else:
+                # Regular BMP character
+                unicode_char = chr(code_point)
+            
+            # Check if it's a control character that should be rejected
+            if ord(unicode_char) <= 0x1F:
+                raise JsonPathLexerError(f'Control character U+{ord(unicode_char):04X} is not allowed in string literals')
+            t.lexer.string_value += unicode_char
+        except ValueError:
+            raise JsonPathLexerError(f'Invalid unicode escape sequence {t.value}')
 
     def t_doublequote_escape(self, t):
         r'\\.'
-        t.lexer.string_value += t.value[1]
+        escaped_char = t.value[1]
+        escape_map = {
+            '"': '"',
+            '\\': '\\',
+            '/': '/',
+            'b': '\b',
+            'f': '\f',
+            'n': '\n',
+            'r': '\r',
+            't': '\t'
+        }
+        
+        if escaped_char in escape_map:
+            t.lexer.string_value += escape_map[escaped_char]
+        else:
+            raise JsonPathLexerError(f'Invalid escape sequence \\{escaped_char} in string literal')
 
     def t_doublequote_end(self, t):
         r'"'
         t.value = t.lexer.string_value
-        t.type = 'ID'
+        t.type = 'STRING'  # Quoted strings are string literals
         t.lexer.string_value = None
         t.lexer.pop_state()
         return t

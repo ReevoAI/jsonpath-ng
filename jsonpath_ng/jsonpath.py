@@ -13,6 +13,7 @@ auto_id_field = None
 
 NOT_SET = object()
 LIST_KEY = object()
+UNDEFINED = object()  # Sentinel for undefined/non-existent fields
 
 
 class JSONPath:
@@ -547,6 +548,12 @@ class Union(JSONPath):
     def find(self, data):
         return self.left.find(data) + self.right.find(data)
 
+    def __str__(self):
+        return f'({self.left}|{self.right})'
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.left!r}, {self.right!r})'
+
     def __eq__(self, other):
         return isinstance(other, Union) and self.left == other.left and self.right == other.right
 
@@ -593,29 +600,67 @@ class Fields(JSONPath):
     def __init__(self, *fields):
         self.fields = fields
 
-    @staticmethod
-    def get_field_datum(datum, field, create):
+    @staticmethod  
+    def get_field_datum(datum, field, create, is_wildcard_expansion=False):
         if field == auto_id_field:
             return AutoIdForDatum(datum)
-        try:
-            field_value = datum.value.get(field, NOT_SET)
-            if field_value is NOT_SET:
-                if create:
-                    datum.value[field] = field_value = {}
-                else:
-                    return None
-            return DatumInContext(field_value, path=Fields(field), context=datum)
-        except (TypeError, AttributeError):
-            return None
+        
+        # Handle dictionary/object access
+        if hasattr(datum.value, 'get'):
+            try:
+                field_value = datum.value.get(field, NOT_SET)
+                if field_value is NOT_SET:
+                    if create:
+                        datum.value[field] = field_value = {}
+                    else:
+                        return None
+                return DatumInContext(field_value, path=Fields(field), context=datum)
+            except (TypeError, AttributeError):
+                pass
+        
+        # Handle array/list access for numeric string fields
+        # Per JSONPath RFC 9535, explicit field access like @['0'] should only work on objects
+        # But wildcard expansion like @.* should work on arrays by generating numeric field names
+        if (hasattr(datum.value, '__getitem__') and 
+            hasattr(datum.value, '__len__') and
+            not isinstance(datum.value, str)):
+            try:
+                index = int(field)
+                # Only allow array access for numeric fields if it's from wildcard expansion
+                # or if the field is actually numeric (not a quoted string)
+                if is_wildcard_expansion and 0 <= index < len(datum.value):
+                    field_value = datum.value[index]
+                    return DatumInContext(field_value, path=Index(index), context=datum)
+                elif create and is_wildcard_expansion:
+                    # Extend the list if needed
+                    while len(datum.value) <= index:
+                        datum.value.append({})
+                    return DatumInContext(datum.value[index], path=Index(index), context=datum)
+                # For explicit field access like @['0'], don't convert to array index
+            except (ValueError, TypeError, IndexError):
+                # If the field is not a valid integer, don't try array access
+                pass
+        
+        return None
 
     def reified_fields(self, datum):
         if '*' not in self.fields:
             return self.fields
         else:
             try:
+                # Try object keys first
                 fields = tuple(datum.value.keys())
                 return fields if auto_id_field is None else fields + (auto_id_field,)
             except AttributeError:
+                # For arrays/lists (but not strings), use indices as field names
+                if (hasattr(datum.value, '__len__') and 
+                    hasattr(datum.value, '__getitem__') and
+                    not isinstance(datum.value, str)):
+                    try:
+                        fields = tuple(str(i) for i in range(len(datum.value)))
+                        return fields if auto_id_field is None else fields + (auto_id_field,)
+                    except (TypeError, ValueError):
+                        pass
                 return ()
 
     def find(self, datum):
@@ -626,7 +671,9 @@ class Fields(JSONPath):
 
     def _find_base(self, datum, create):
         datum = DatumInContext.wrap(datum)
-        field_data = [self.get_field_datum(datum, field, create)
+        # Check if this Fields instance contains a wildcard
+        has_wildcard = '*' in self.fields
+        field_data = [self.get_field_datum(datum, field, create, is_wildcard_expansion=has_wildcard)
                       for field in self.reified_fields(datum)]
         return [fd for fd in field_data if fd is not None]
 
@@ -703,8 +750,18 @@ class Index(JSONPath):
         rv = []
         for index in self.indices:
             # invalid indices do not crash, return [] instead
-            if datum.value and len(datum.value) > index:
-                rv += [DatumInContext(datum.value[index], path=Index(index), context=datum)]
+            # Only apply index operations to sequences (lists, tuples), not dicts or strings
+            if (datum.value and 
+                hasattr(datum.value, '__len__') and 
+                hasattr(datum.value, '__getitem__') and 
+                not isinstance(datum.value, (str, dict))):
+                try:
+                    # Use Python's indexing which handles negative indices
+                    if -len(datum.value) <= index < len(datum.value):
+                        rv += [DatumInContext(datum.value[index], path=Index(index), context=datum)]
+                except (IndexError, TypeError):
+                    # Index out of bounds, skip
+                    pass
         return rv
 
     def update(self, data, val):
@@ -744,7 +801,10 @@ class Index(JSONPath):
         return isinstance(other, Index) and sorted(self.indices) == sorted(other.indices)
 
     def __str__(self):
-        return '[%i]' % self.indices
+        if len(self.indices) == 1:
+            return '[%i]' % self.indices[0]
+        else:
+            return '[%s]' % ','.join(str(i) for i in self.indices)
 
     def __repr__(self):
         return '%s(indices=%r)' % (self.__class__.__name__, self.indices)
@@ -756,7 +816,7 @@ class Index(JSONPath):
             value += [{} for __ in range(pad)]
 
     def __hash__(self):
-        return hash(self.index)
+        return hash(tuple(sorted(self.indices)))
 
 
 class Slice(JSONPath):
@@ -794,11 +854,15 @@ class Slice(JSONPath):
         # Used for catching null value instead of empty list in path
         if not datum.value:
             return []
-        # Here's the hack. If it is a dictionary or some kind of constant,
-        # put it in a single-element list
-        if (isinstance(datum.value, dict) or isinstance(datum.value, int) or isinstance(datum.value, str)):
-            return self.find(DatumInContext([datum.value], path=datum.path, context=datum.context))
+        
+        # Only apply slice operations to arrays/lists, not to other types
+        if not (hasattr(datum.value, '__getitem__') and hasattr(datum.value, '__len__') and not isinstance(datum.value, (str, dict))):
+            return []
 
+        # Handle step 0 specially - it should return empty result per compliance tests
+        if self.step == 0:
+            return []
+        
         # Some iterators do not support slicing but we can still
         # at least work for '*'
         if self.start is None and self.end is None and self.step is None:
@@ -869,3 +933,542 @@ def _clean_list_keys(struct_):
             for key, value in struct_.items():
                 struct_[key] = _clean_list_keys(value)
     return struct_
+
+
+class Filter(JSONPath):
+    """
+    JSONPath filter expression [?expression].
+    Filters array elements or object values based on a boolean expression.
+    """
+    
+    def __init__(self, expression):
+        self.expression = expression
+        self._validate_filter_expression(expression)
+    
+    def find(self, datum):
+        datum = DatumInContext.wrap(datum)
+        
+        # Filter works on arrays and objects
+        if isinstance(datum.value, list):
+            result = []
+            for i, item in enumerate(datum.value):
+                item_datum = DatumInContext(item, path=Index(i), context=datum)
+                if self._evaluate_expression(self.expression, item_datum):
+                    result.append(item_datum)
+            return result
+        elif isinstance(datum.value, dict):
+            result = []
+            for key, value in datum.value.items():
+                item_datum = DatumInContext(value, path=Fields(key), context=datum)
+                if self._evaluate_expression(self.expression, item_datum):
+                    result.append(item_datum)
+            return result
+        else:
+            return []
+    
+    def _validate_filter_expression(self, expr):
+        """Validate that filter expression only uses allowed constructs per RFC 9535"""
+        from jsonpath_ng.exceptions import JsonPathParserError
+        
+        # Check for invalid constructs recursively
+        def check_expr(e, in_comparison=False, is_root=False, is_logical_operand=False):
+            # Bare literals are not allowed at root level or as operands to logical operations
+            if (is_root or is_logical_operand) and isinstance(e, Literal):
+                raise JsonPathParserError('Bare literal values are not allowed in filter expressions, literals must be compared')
+            # Bare function calls must be compared (except in logical contexts where they're evaluated for truthiness)
+            elif (is_root or is_logical_operand) and isinstance(e, FunctionCall):
+                if e.function_name in ['count', 'length', 'value']:
+                    raise JsonPathParserError(f'Function {e.function_name}() result must be compared, bare function calls are not allowed')
+            # Check for incorrectly capitalized keywords
+            elif isinstance(e, Fields) and len(e.fields) == 1 and e.fields[0] in ['True', 'False', 'Null', 'NULL', 'TRUE', 'FALSE']:
+                raise JsonPathParserError(f'Invalid keyword {e.fields[0]}, use lowercase: {e.fields[0].lower()}')
+            # Wildcards in comparisons are not allowed
+            elif isinstance(e, Fields) and in_comparison and '*' in e.fields:
+                raise JsonPathParserError('Wildcard notation in comparisons is not allowed in filter expressions')
+            # Slices are more restrictive
+            elif isinstance(e, Slice) and in_comparison:
+                raise JsonPathParserError('Slice notation in comparisons is not allowed in filter expressions')
+            # Descendants in comparisons are not allowed 
+            elif isinstance(e, Descendants) and in_comparison:
+                raise JsonPathParserError('Descendant notation in comparisons is not allowed in filter expressions')
+            # Unions in comparisons are not allowed
+            elif isinstance(e, Union) and in_comparison:
+                raise JsonPathParserError('Union notation in comparisons is not allowed in filter expressions')
+            elif isinstance(e, Child):
+                # Check both left and right sides of the child expression
+                check_expr(e.left, in_comparison)
+                check_expr(e.right, in_comparison)
+            elif hasattr(e, 'left') and hasattr(e, 'right'):
+                # For binary operations - determine context
+                type_name = type(e).__name__
+                if type_name == 'Comparison':
+                    # Comparison operands are in comparison context
+                    check_expr(e.left, True)
+                    check_expr(e.right, True)
+                    
+                    # Check for invalid function-to-boolean comparisons
+                    if isinstance(e.left, FunctionCall) and e.left.function_name in ['match', 'search'] and isinstance(e.right, Literal) and isinstance(e.right.value, bool):
+                        raise JsonPathParserError(f'Function {e.left.function_name}() result cannot be compared to boolean literal')
+                    elif isinstance(e.right, FunctionCall) and e.right.function_name in ['match', 'search'] and isinstance(e.left, Literal) and isinstance(e.left.value, bool):
+                        raise JsonPathParserError(f'Function {e.right.function_name}() result cannot be compared to boolean literal')
+                elif type_name in ['LogicalAnd', 'LogicalOr']:
+                    # Logical operands cannot be bare literals
+                    check_expr(e.left, in_comparison, is_logical_operand=True)
+                    check_expr(e.right, in_comparison, is_logical_operand=True)
+                else:
+                    # Other binary operations
+                    check_expr(e.left, in_comparison)
+                    check_expr(e.right, in_comparison)
+            elif hasattr(e, 'expr'):
+                # For unary operations like NOT
+                check_expr(e.expr, in_comparison, is_logical_operand=True)
+            elif hasattr(e, 'expression'):
+                # For Filter expressions
+                check_expr(e.expression, in_comparison)
+            elif hasattr(e, 'arguments'):
+                # For function calls - arguments can contain any JSONPath expressions
+                for arg in e.arguments:
+                    check_expr(arg, False)  # Function arguments are not in comparison context
+        
+        check_expr(expr, is_root=True)
+    
+    def _evaluate_expression(self, expr, datum):
+        """Evaluate an expression in the context of a datum"""
+        if hasattr(expr, 'evaluate'):
+            return bool(expr.evaluate(datum))
+        elif hasattr(expr, 'find'):
+            # For regular JSONPath expressions, check if they match anything
+            matches = expr.find(datum)
+            return len(matches) > 0
+        else:
+            return bool(expr)
+    
+    def __str__(self):
+        return f'[?{self.expression}]'
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.expression!r})'
+    
+    def __eq__(self, other):
+        return isinstance(other, Filter) and self.expression == other.expression
+    
+    def __hash__(self):
+        return hash(self.expression)
+
+
+class CurrentNode(JSONPath):
+    """
+    Represents the current node (@) in filter expressions.
+    """
+    
+    def find(self, datum):
+        return [DatumInContext.wrap(datum)]
+    
+    def evaluate(self, datum):
+        # For existence tests, we check if the node exists, not if its value is truthy
+        # The node exists if we can reach it, regardless of value
+        return True
+    
+    def __str__(self):
+        return '@'
+    
+    def __repr__(self):
+        return 'CurrentNode()'
+    
+    def __eq__(self, other):
+        return isinstance(other, CurrentNode)
+    
+    def __hash__(self):
+        return hash('current_node')
+
+
+class Literal(JSONPath):
+    """
+    Represents a literal value in filter expressions.
+    """
+    
+    def __init__(self, value):
+        self.value = value
+    
+    def find(self, datum):
+        return [DatumInContext(self.value, path=Root(), context=None)]
+    
+    def evaluate(self, datum):
+        return self.value
+    
+    def __str__(self):
+        if isinstance(self.value, str):
+            return f"'{self.value}'"
+        return str(self.value)
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.value!r})'
+    
+    def __eq__(self, other):
+        return isinstance(other, Literal) and self.value == other.value
+    
+    def __hash__(self):
+        return hash(self.value)
+
+
+class Comparison(JSONPath):
+    """
+    Represents a comparison operation in filter expressions.
+    """
+    
+    def __init__(self, left, operator, right):
+        self.left = left
+        self.operator = operator
+        self.right = right
+    
+    def find(self, datum):
+        return [DatumInContext(self.evaluate(datum), path=Root(), context=None)]
+    
+    def evaluate(self, datum):
+        left_value = self._get_value(self.left, datum)
+        right_value = self._get_value(self.right, datum)
+        
+        # Handle undefined fields specially
+        if left_value is UNDEFINED and right_value is UNDEFINED:
+            # UNDEFINED == UNDEFINED is true, UNDEFINED != UNDEFINED is false
+            return self.operator == '=='
+        elif left_value is UNDEFINED:
+            if self.operator == '==' and right_value is None:
+                return False  # undefined != null 
+            elif self.operator == '!=' and right_value is None:
+                return True   # undefined != null is true
+            else:
+                return False  # undefined compared to anything else is false
+        elif right_value is UNDEFINED:
+            if self.operator == '==' and left_value is None:
+                return False  # null != undefined
+            elif self.operator == '!=' and left_value is None:
+                return True   # null != undefined is true
+            else:
+                return False  # anything else compared to undefined is false
+        
+        # Handle null comparisons specially per JSONPath spec
+        if left_value is None or right_value is None:
+            if self.operator == '==':
+                return left_value == right_value
+            elif self.operator == '!=':
+                return left_value != right_value
+            elif self.operator in ['<', '<=', '>', '>=']:
+                # null comparisons: null is only equal to null
+                if left_value is None and right_value is None:
+                    return self.operator in ['<=', '>=']  # null <= null and null >= null are true
+                else:
+                    return False  # null compared to non-null is always false
+        
+        try:
+            if self.operator == '==':
+                return left_value == right_value
+            elif self.operator == '!=':
+                return left_value != right_value
+            elif self.operator == '<':
+                return left_value < right_value
+            elif self.operator == '<=':
+                return left_value <= right_value
+            elif self.operator == '>':
+                return left_value > right_value
+            elif self.operator == '>=':
+                return left_value >= right_value
+            else:
+                return False
+        except (TypeError, ValueError):
+            return False
+    
+    def _get_value(self, expr, datum):
+        # Special case: CurrentNode should return the actual value, not existence boolean
+        if isinstance(expr, CurrentNode):
+            return datum.value if hasattr(datum, 'value') else datum
+        elif hasattr(expr, 'evaluate'):
+            return expr.evaluate(datum)
+        elif hasattr(expr, 'find'):
+            matches = expr.find(datum)
+            if matches:
+                return matches[0].value
+            else:
+                # No matches found, return UNDEFINED to represent "field doesn't exist"
+                return UNDEFINED
+        return expr
+    
+    def __str__(self):
+        return f'{self.left} {self.operator} {self.right}'
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.left!r}, {self.operator!r}, {self.right!r})'
+    
+    def __eq__(self, other):
+        return (isinstance(other, Comparison) and 
+                self.left == other.left and 
+                self.operator == other.operator and 
+                self.right == other.right)
+    
+    def __hash__(self):
+        return hash((self.left, self.operator, self.right))
+
+
+class LogicalAnd(JSONPath):
+    """
+    Represents logical AND operation in filter expressions.
+    """
+    
+    def __init__(self, left, right):
+        self.left = left
+        self.right = right
+    
+    def find(self, datum):
+        return [DatumInContext(self.evaluate(datum), path=Root(), context=None)]
+    
+    def evaluate(self, datum):
+        left_result = self._get_boolean(self.left, datum)
+        if not left_result:
+            return False
+        return self._get_boolean(self.right, datum)
+    
+    def _get_boolean(self, expr, datum):
+        if hasattr(expr, 'evaluate'):
+            return bool(expr.evaluate(datum))
+        elif hasattr(expr, 'find'):
+            matches = expr.find(datum)
+            # For existence tests, we only check if matches exist, not if their values are truthy
+            return bool(matches)
+        return bool(expr)
+    
+    def __str__(self):
+        return f'{self.left} && {self.right}'
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.left!r}, {self.right!r})'
+    
+    def __eq__(self, other):
+        return (isinstance(other, LogicalAnd) and 
+                self.left == other.left and 
+                self.right == other.right)
+    
+    def __hash__(self):
+        return hash((self.left, self.right))
+
+
+class LogicalOr(JSONPath):
+    """
+    Represents logical OR operation in filter expressions.
+    """
+    
+    def __init__(self, left, right):
+        self.left = left
+        self.right = right
+    
+    def find(self, datum):
+        return [DatumInContext(self.evaluate(datum), path=Root(), context=None)]
+    
+    def evaluate(self, datum):
+        left_result = self._get_boolean(self.left, datum)
+        if left_result:
+            return True
+        return self._get_boolean(self.right, datum)
+    
+    def _get_boolean(self, expr, datum):
+        if hasattr(expr, 'evaluate'):
+            return bool(expr.evaluate(datum))
+        elif hasattr(expr, 'find'):
+            matches = expr.find(datum)
+            # For existence tests, we only check if matches exist, not if their values are truthy
+            return bool(matches)
+        return bool(expr)
+    
+    def __str__(self):
+        return f'{self.left} || {self.right}'
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.left!r}, {self.right!r})'
+    
+    def __eq__(self, other):
+        return (isinstance(other, LogicalOr) and 
+                self.left == other.left and 
+                self.right == other.right)
+    
+    def __hash__(self):
+        return hash((self.left, self.right))
+
+
+class LogicalNot(JSONPath):
+    """
+    Represents logical NOT operation in filter expressions.
+    """
+    
+    def __init__(self, expr):
+        self.expr = expr
+    
+    def find(self, datum):
+        return [DatumInContext(self.evaluate(datum), path=Root(), context=None)]
+    
+    def evaluate(self, datum):
+        return not self._get_boolean(self.expr, datum)
+    
+    def _get_boolean(self, expr, datum):
+        if hasattr(expr, 'evaluate'):
+            return bool(expr.evaluate(datum))
+        elif hasattr(expr, 'find'):
+            matches = expr.find(datum)
+            # For existence tests, we only check if matches exist, not if their values are truthy
+            return bool(matches)
+        return bool(expr)
+    
+    def __str__(self):
+        return f'!{self.expr}'
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.expr!r})'
+    
+    def __eq__(self, other):
+        return isinstance(other, LogicalNot) and self.expr == other.expr
+    
+    def __hash__(self):
+        return hash(self.expr)
+
+
+class FunctionCall(JSONPath):
+    """
+    Represents function calls in filter expressions (like match, search).
+    """
+    
+    def __init__(self, function_name, arguments):
+        self.function_name = function_name
+        self.arguments = arguments
+    
+    def find(self, datum):
+        return [DatumInContext(self.evaluate(datum), path=Root(), context=None)]
+    
+    def evaluate(self, datum):
+        import re
+        try:
+            import regex
+            USE_REGEX_MODULE = True
+        except ImportError:
+            USE_REGEX_MODULE = False
+        
+        if self.function_name == 'match':
+            # match(value, regex) - test if ENTIRE value matches regex (anchored match)
+            if len(self.arguments) != 2:
+                return False
+            
+            value = self._get_value(self.arguments[0], datum)
+            pattern = self._get_value(self.arguments[1], datum)
+            
+            if not isinstance(value, str) or not isinstance(pattern, str):
+                return False
+            
+            try:
+                # Transform pattern for JSONPath RFC 9535 compliance
+                # The '.' metacharacter should match any character except Unicode control characters
+                if pattern == '.':
+                    pattern = '[^\\p{Cc}]' if USE_REGEX_MODULE else '[^\\x00-\\x1F\\x7F]'
+                
+                # For match(), we need to match the entire string, so use fullmatch() or anchor the pattern
+                if USE_REGEX_MODULE:
+                    return bool(regex.fullmatch(pattern, value))
+                else:
+                    return bool(re.fullmatch(pattern, value))
+            except Exception:
+                return False
+                
+        elif self.function_name == 'search':
+            # search(value, regex) - find pattern anywhere in the string (not anchored)
+            if len(self.arguments) != 2:
+                return False
+            
+            value = self._get_value(self.arguments[0], datum)
+            pattern = self._get_value(self.arguments[1], datum)
+            
+            if not isinstance(value, str) or not isinstance(pattern, str):
+                return False
+            
+            try:
+                # Transform pattern for JSONPath RFC 9535 compliance
+                # The '.' metacharacter should match any character except Unicode control characters
+                if pattern == '.':
+                    pattern = '[^\\p{Cc}]' if USE_REGEX_MODULE else '[^\\x00-\\x1F\\x7F]'
+                
+                if USE_REGEX_MODULE:
+                    return bool(regex.search(pattern, value))
+                else:
+                    return bool(re.search(pattern, value))
+            except Exception:
+                return False
+                
+        elif self.function_name == 'length':
+            # length(value) - get length of value
+            if len(self.arguments) != 1:
+                return UNDEFINED
+            
+            value = self._get_value(self.arguments[0], datum)
+            
+            # If value is undefined or null, length is also undefined
+            if value is UNDEFINED or value is None:
+                return UNDEFINED
+            
+            try:
+                return len(value)
+            except (TypeError, AttributeError):
+                return UNDEFINED
+                
+        elif self.function_name == 'count':
+            # count(nodelist) - count number of nodes
+            if len(self.arguments) != 1:
+                return 0
+            
+            if hasattr(self.arguments[0], 'find'):
+                matches = self.arguments[0].find(datum)
+                return len(matches)
+            else:
+                return 1 if self.arguments[0] is not None else 0
+                
+        elif self.function_name == 'value':
+            # value(nodelist) - return single value from nodelist, undefined if not exactly one
+            if len(self.arguments) != 1:
+                return UNDEFINED
+            
+            if hasattr(self.arguments[0], 'find'):
+                # For value() function, evaluate the expression in the current filter context
+                # This allows @.a to be evaluated against the current item being filtered
+                matches = self.arguments[0].find(datum)
+                if len(matches) == 1:
+                    return matches[0].value
+                else:
+                    return UNDEFINED  # zero or multiple matches
+            else:
+                return self.arguments[0]
+        
+        # Unknown function
+        return False
+    
+    def _get_value(self, expr, datum):
+        # Special case: CurrentNode should return the actual value, not existence boolean
+        if isinstance(expr, CurrentNode):
+            return datum.value if hasattr(datum, 'value') else datum
+        elif hasattr(expr, 'evaluate'):
+            return expr.evaluate(datum)
+        elif hasattr(expr, 'find'):
+            matches = expr.find(datum)
+            if matches:
+                return matches[0].value
+            else:
+                return UNDEFINED
+        return expr
+    
+    def __str__(self):
+        args_str = ', '.join(str(arg) for arg in self.arguments)
+        return f'{self.function_name}({args_str})'
+    
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.function_name!r}, {self.arguments!r})'
+    
+    def __eq__(self, other):
+        return (isinstance(other, FunctionCall) and 
+                self.function_name == other.function_name and
+                self.arguments == other.arguments)
+    
+    def __hash__(self):
+        return hash((self.function_name, tuple(self.arguments)))
